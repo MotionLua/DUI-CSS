@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<!--
+  MOTION Scroll DUI - Single file: menu + notifications + keybind prompt + text input.
+  - Notifications: bottom-right, custom sound from NOTIFICATION_SOUND_URL.
+  - Keybind: shown on first inject/start; press any key (shown below), confirm with Enter only.
+  - Text input: Lua sends showTextInput; modal has Cancel, Escape to close, paste allowed, mouse enabled.
+  - Lua sends messages via MachoSendDuiMessage(dui, json). See IMPLEMENTATION.txt for payloads.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0">
+  <title>MOTION – Scroll Menu</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.1.1/css/all.min.css">
+  <link rel="stylesheet" href="scroll.css">
+</head>
+<body>
+  <div id="bg"></div>
+  <div id="panel">
+    <div class="banner">
+      <img id="banner-img" src="https://raw.githubusercontent.com/MotionLua/motion-banners/refs/heads/main/theme5.png" alt="" onerror="this.style.display='none'; this.nextElementSibling.classList.add('banner-text'); this.nextElementSibling.style.display='inline';">
+      <span id="banner-text" style="display:none;">MOTION</span>
+    </div>
+    <div class="categories" id="categories">
+      <span class="category active">Main Menu</span>
+    </div>
+    <div class="tabs-wrap">
+        <div class="tabs" id="tabs" tabindex="0">
+          <div class="highlight" id="highlight"></div>
+        </div>
+    </div>
+    <div class="footer">
+      <span id="footer-url">https://motionlua.mysellauth.com/</span>
+      <span id="indicator">(0/0)</span>
+    </div>
+  </div>
+
+  <!-- Notifications container: bottom-right, filled by JS when Lua sends showNotification -->
+  <div id="notifications"></div>
+
+  <!-- Keybind prompt: shown on first load or when Lua sends showKeybindPrompt; confirm with Enter -->
+  <div id="keybind-overlay">
+    <div id="keybind-box">
+      <div class="keybind-title">Set Menu Keybind</div>
+      <div class="keybind-key" id="keybind-key-display">Press any key...</div>
+      <div class="keybind-hint">Confirm with Enter</div>
+    </div>
+  </div>
+
+  <!-- Text input modal: shown when Lua sends showTextInput; mouse enabled, Cancel, Escape to close, paste allowed -->
+  <div id="textinput-overlay">
+    <div id="textinput-box">
+      <div class="textinput-title" id="textinput-title">Enter value</div>
+      <input type="text" id="textinput-field" placeholder="" autocomplete="off" />
+      <div class="textinput-buttons">
+        <button type="button" id="textinput-cancel">Cancel</button>
+        <button type="button" id="textinput-confirm" class="confirm">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Choice overlay: shown on injection when Lua sends showChoice; two buttons Macho / Motion DUI -->
+  <div id="choice-overlay">
+    <div id="choice-box">
+      <div class="choice-title">Choose menu</div>
+      <div class="choice-buttons">
+        <button type="button" id="choice-macho" class="choice-btn">Macho Menu</button>
+        <button type="button" id="choice-motion" class="choice-btn primary">Motion DUI</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Motion logo: always visible bottom-left when Motion DUI menu is active (set via showScrollMenu + motionLogo) -->
+  <div id="motion-logo">
+    <img id="motion-logo-img" src="" alt="MOTION" />
+  </div>
+
+  <script>
+    (function() {
+      var panel = document.getElementById('panel');
+      var tabsEl = document.getElementById('tabs');
+      var highlightEl = document.getElementById('highlight');
+      var categoriesEl = document.getElementById('categories');
+      var indicatorEl = document.getElementById('indicator');
+      var bannerImg = document.getElementById('banner-img');
+
+      var elements = [];
+      var selectedIndex = 0;
+      var history = [];
+      var categories = null;
+      var categoryIndex = 0;
+      var tabRefs = [];
+
+      /* Notification sound: use direct .mp3/.wav URL if this path does not play */
+      var NOTIFICATION_SOUND_URL = 'https://motionlua.github.io/notification-sound/';
+      function playNotificationSound() {
+        try {
+          var a = new Audio(NOTIFICATION_SOUND_URL);
+          a.volume = 0.6;
+          a.play().catch(function() {});
+        } catch (e) {}
+        /* Fallback: short beep if external sound fails */
+        setTimeout(function() {
+          try {
+            var ctx = window._navAudioCtx || (window._navAudioCtx = new (window.AudioContext || window.webkitAudioContext)());
+            var now = ctx.currentTime;
+            var osc = ctx.createOscillator();
+            var gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(520, now);
+            gain.gain.setValueAtTime(0.0001, now);
+            gain.gain.exponentialRampToValueAtTime(0.05, now + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.06);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(now);
+            osc.stop(now + 0.07);
+          } catch (e2) {}
+        }, 100);
+      }
+
+      /* ---- KEYBIND PROMPT: show on first message from Lua (or when Lua sends showKeybindPrompt) ---- */
+      var keybindOverlay = document.getElementById('keybind-overlay');
+      var keybindKeyDisplay = document.getElementById('keybind-key-display');
+      var keybindPromptShown = false;
+      var pendingKeybindKey = null;
+
+      function showKeybindPrompt() {
+        keybindPromptShown = true;
+        pendingKeybindKey = null;
+        keybindKeyDisplay.textContent = 'Press any key...';
+        keybindOverlay.classList.add('show');
+      }
+      function hideKeybindPrompt() {
+        keybindOverlay.classList.remove('show');
+      }
+      function onKeybindKeyDown(e) {
+        if (!keybindOverlay.classList.contains('show')) return;
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (pendingKeybindKey !== null) {
+            window.__keybindResult = { key: pendingKeybindKey }; /* Lua: poll or inject to read, then set to null */
+            hideKeybindPrompt();
+            document.removeEventListener('keydown', onKeybindKeyDown);
+          }
+          return;
+        }
+        if (e.key === 'Meta' || e.key === 'Win') return;
+        e.preventDefault();
+        var name = e.key || (e.code && e.code.replace(/^Key/, '')) || 'Unknown';
+        pendingKeybindKey = name;
+        keybindKeyDisplay.textContent = name;
+      }
+
+      /* ---- TEXT INPUT MODAL ---- */
+      var textinputOverlay = document.getElementById('textinput-overlay');
+      var textinputTitle = document.getElementById('textinput-title');
+      var textinputField = document.getElementById('textinput-field');
+      var textinputCancelBtn = document.getElementById('textinput-cancel');
+      var textinputConfirmBtn = document.getElementById('textinput-confirm');
+      var textinputCallbackId = null;
+
+      function showTextInputModal(title, placeholder, maxLen, callbackId) {
+        textinputCallbackId = callbackId || '';
+        textinputTitle.textContent = title || 'Enter value';
+        textinputField.placeholder = placeholder || '';
+        textinputField.maxLength = maxLen > 0 ? maxLen : 524288;
+        textinputField.value = '';
+        textinputOverlay.classList.add('show');
+        textinputField.focus();
+      }
+      function hideTextInputModal() {
+        textinputOverlay.classList.remove('show');
+        textinputCallbackId = null;
+      }
+      function submitTextInput() {
+        var val = textinputField.value;
+        window.__textInputResult = { callback: textinputCallbackId, value: val, cancelled: false }; /* Lua: poll then set to null */
+        hideTextInputModal();
+      }
+      function cancelTextInput() {
+        window.__textInputResult = { callback: textinputCallbackId, value: '', cancelled: true };
+        hideTextInputModal();
+      }
+      textinputConfirmBtn.addEventListener('click', submitTextInput);
+      textinputCancelBtn.addEventListener('click', cancelTextInput);
+      textinputField.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); submitTextInput(); }
+        if (e.key === 'Escape') { e.preventDefault(); cancelTextInput(); }
+      });
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && textinputOverlay.classList.contains('show')) {
+          e.preventDefault();
+          cancelTextInput();
+        }
+      });
+
+      /* Choice overlay: set __menuChoice for Lua to poll */
+      var choiceOverlay = document.getElementById('choice-overlay');
+      document.getElementById('choice-macho').addEventListener('click', function() {
+        window.__menuChoice = 'macho';
+        choiceOverlay.classList.remove('show');
+      });
+      document.getElementById('choice-motion').addEventListener('click', function() {
+        window.__menuChoice = 'motion';
+        choiceOverlay.classList.remove('show');
+      });
+
+      /* PS5-style navigation sound: short soft "tock" */
+      function playNavSound() {
+        try {
+          var ctx = window._navAudioCtx || (window._navAudioCtx = new (window.AudioContext || window.webkitAudioContext)());
+          var now = ctx.currentTime;
+          var osc = ctx.createOscillator();
+          var gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(520, now);
+          osc.frequency.exponentialRampToValueAtTime(380, now + 0.032);
+          gain.gain.setValueAtTime(0.0001, now);
+          gain.gain.exponentialRampToValueAtTime(0.06, now + 0.008);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.04);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(now);
+          osc.stop(now + 0.045);
+        } catch (e) {}
+      }
+
+      function updateIndicator() {
+        var nonDiv = elements.filter(function(e) { return e.type !== 'divider'; });
+        var total = nonDiv.length;
+        if (total === 0) { indicatorEl.textContent = '0/0'; return; }
+        var idx = nonDiv.indexOf(elements[selectedIndex]);
+        if (idx < 0) idx = 0;
+        indicatorEl.textContent = '(' + (idx + 1) + '/' + total + ')';
+      }
+      function renderCategories() {
+        if (categories && categories.length) {
+          categoriesEl.innerHTML = categories.map(function(c, i) {
+            return '<span class="category' + (i === categoryIndex ? ' active' : '') + '">' + (c.label || '') + '</span>';
+          }).join('');
+        } else {
+          categoriesEl.innerHTML = '<span class="category active">Main Menu</span>';
+        }
+      }
+      function buildTabHtml(el, index) {
+        var isSel = index === selectedIndex;
+        var label = (el.label || '').replace(/</g, '&lt;');
+        var control = '';
+        if (el.type === 'subMenu' || el.categories) control = '<i class="fa-solid fa-angle-right"></i>';
+        if (el.type === 'checkbox') {
+          control = '<div class="cb' + (el.checked ? ' on' : '') + '"><div class="dot"></div></div>';
+        }
+        if (el.type === 'slider') {
+          var min = el.min != null ? el.min : 0;
+          var max = el.max != null ? el.max : 100;
+          var val = el.value != null ? el.value : min;
+          var pct = ((val - min) / (max - min)) * 100;
+          control = '<div class="slider"><div class="fill" style="width:' + pct + '%"></div><div class="thumb"></div></div>';
+          if (isSel) label = label + ': ' + val;
+        }
+        if (el.type === 'scrollable') {
+          var vals = el.values || [];
+          var v = (el.value != null ? el.value : 1) - 1;
+          var disp = vals[v] != null ? vals[v] : '';
+          control = '<div class="scrollable-val"><span>-</span><span>' + (disp + '').replace(/</g, '&lt;') + '</span><span>-</span></div>';
+        }
+        if (el.type === 'inputbox') {
+          var val = (el.value != null && el.value !== '') ? (el.value + '').replace(/</g, '&lt;') : (el.placeholder || 'Tap to type');
+          control = '<span class="inputbox-hint">' + val + '</span>';
+        }
+        if (el.type === 'divider') {
+          return '<div class="tab tab-divider" data-index="' + index + '"><div class="divider"><div class="line"></div><span class="label">' + label + '</span><div class="line"></div></div></div>';
+        }
+        return '<div class="tab' + (isSel ? ' selected' : '') + '" data-index="' + index + '"><span class="label">' + label + '</span><div class="control">' + control + '</div></div>';
+      }
+      function renderTabs() {
+        tabRefs = [];
+        var html = '<div class="highlight" id="highlight"></div>';
+        elements.forEach(function(el, i) {
+          html += buildTabHtml(el, i);
+        });
+        tabsEl.innerHTML = html;
+        highlightEl = document.getElementById('highlight');
+        tabRefs = Array.from(tabsEl.querySelectorAll('.tab'));
+        updateHighlight();
+        updateIndicator();
+      }
+      function updateHighlight() {
+        var sel = elements[selectedIndex];
+        if (!sel || sel.type === 'divider') {
+          var next = selectedIndex;
+          for (var i = 0; i < elements.length; i++) {
+            if (elements[next].type !== 'divider') break;
+            next = (next + 1) % elements.length;
+          }
+          if (elements[next] && elements[next].type !== 'divider') selectedIndex = next;
+        }
+        var tabEl = tabRefs[selectedIndex];
+        if (!highlightEl || !tabEl) {
+          if (highlightEl) highlightEl.style.display = 'none';
+          return;
+        }
+        highlightEl.style.display = 'block';
+        highlightEl.style.top = tabEl.offsetTop + 'px';
+        highlightEl.style.height = tabEl.offsetHeight + 'px';
+        tabRefs.forEach(function(t, i) { t.classList.toggle('selected', i === selectedIndex); });
+        tabEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+      function updateMenu() {
+        renderCategories();
+        renderTabs();
+      }
+      function clampIndex(next) {
+        next = (next + elements.length) % elements.length;
+        while (elements[next] && elements[next].type === 'divider') {
+          next = (next + 1) % elements.length;
+          if (next === selectedIndex) break;
+        }
+        return next;
+      }
+      function move(dir) {
+        var next = selectedIndex;
+        do {
+          next = (next + dir + elements.length) % elements.length;
+        } while (elements[next] && elements[next].type === 'divider' && next !== selectedIndex);
+        selectedIndex = next;
+        playNavSound();
+        updateHighlight();
+        updateIndicator();
+      }
+      function pushMenuAction(id, type, value) {
+        if (id == null) return;
+        window.__menuActionResult = { id: id, type: type, value: value };
+      }
+      function onEnter() {
+        var el = elements[selectedIndex];
+        if (!el) return;
+        playNavSound();
+        if (el.type === 'subMenu' && el.categories && el.categories.length) {
+          history.push({ elements: elements, selectedIndex: selectedIndex, categories: categories, categoryIndex: categoryIndex });
+          categories = el.categories;
+          categoryIndex = 0;
+          elements = (categories[0].tabs || []);
+          selectedIndex = 0;
+          updateMenu();
+          return;
+        }
+        if (el.type === 'checkbox') {
+          el.checked = !el.checked;
+          updateMenu();
+          pushMenuAction(el.id, 'checkbox', el.checked);
+          return;
+        }
+        if (el.type === 'button') {
+          pushMenuAction(el.id, 'button');
+          return;
+        }
+        if (el.type === 'slider') {
+          pushMenuAction(el.id, 'slider', el.value);
+          return;
+        }
+        if (el.type === 'scrollable') {
+          pushMenuAction(el.id, 'scrollable', el.value);
+          return;
+        }
+        if (el.type === 'inputbox') {
+          pushMenuAction(el.id, 'inputbox');
+          return;
+        }
+      }
+      function onBack() {
+        if (history.length) {
+          var prev = history.pop();
+          elements = prev.elements;
+          selectedIndex = prev.selectedIndex;
+          categories = prev.categories;
+          categoryIndex = prev.categoryIndex || 0;
+          updateMenu();
+        } else {
+          panel.classList.remove('visible');
+        }
+      }
+      function onLeft() {
+        var el = elements[selectedIndex];
+        if (!el) return;
+        if (el.type === 'slider') {
+          var step = el.step || 1;
+          el.value = Math.max(el.min || 0, (el.value || el.min || 0) - step);
+          updateMenu();
+        } else if (el.type === 'scrollable' && el.values && el.values.length) {
+          el.value = Math.max(1, (el.value || 1) - 1);
+          updateMenu();
+        } else if (categories && categories.length > 1) {
+          categoryIndex = (categoryIndex - 1 + categories.length) % categories.length;
+          elements = categories[categoryIndex].tabs || [];
+          selectedIndex = 0;
+          updateMenu();
+        }
+      }
+      function onRight() {
+        var el = elements[selectedIndex];
+        if (!el) return;
+        if (el.type === 'slider') {
+          var step = el.step || 1;
+          el.value = Math.min(el.max || 100, (el.value || 0) + step);
+          updateMenu();
+        } else if (el.type === 'scrollable' && el.values && el.values.length) {
+          el.value = Math.min(el.values.length, (el.value || 1) + 1);
+          updateMenu();
+        } else if (categories && categories.length > 1) {
+          categoryIndex = (categoryIndex + 1) % categories.length;
+          elements = categories[categoryIndex].tabs || [];
+          selectedIndex = 0;
+          updateMenu();
+        }
+      }
+
+      tabsEl.addEventListener('keydown', function(e) {
+        if (keybindOverlay.classList.contains('show') || textinputOverlay.classList.contains('show')) return;
+        if (!panel.classList.contains('visible') && document.body.classList.contains('in-game')) return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); move(1); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); return; }
+        if (e.key === 'Enter') { e.preventDefault(); onEnter(); return; }
+        if (e.key === 'Backspace') { e.preventDefault(); onBack(); return; }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); onLeft(); return; }
+        if (e.key === 'ArrowRight') { e.preventDefault(); onRight(); return; }
+      });
+
+      tabsEl.addEventListener('click', function(e) {
+        var tab = e.target.closest('.tab[data-index]');
+        if (tab) {
+          var idx = parseInt(tab.getAttribute('data-index'), 10);
+          if (!isNaN(idx) && elements[idx] && elements[idx].type !== 'divider') {
+            selectedIndex = idx;
+            playNavSound();
+            updateHighlight();
+            updateIndicator();
+          }
+        }
+      });
+
+      /* ---- NOTIFICATIONS: add toast, play sound, progress bar ---- */
+      var notificationsEl = document.getElementById('notifications');
+      var notifIdCounter = 0;
+      function showNotification(title, desc, duration) {
+        notifIdCounter++;
+        var id = notifIdCounter;
+        var dur = Math.max(2000, duration || 4000);
+        var el = document.createElement('div');
+        el.className = 'notif';
+        el.id = 'notif-' + id;
+        el.innerHTML = '<div class="notif-title">' + (title + '').replace(/</g, '&lt;') + '</div><div class="notif-desc">' + (desc + '').replace(/</g, '&lt;') + '</div><div class="notif-bar" style="animation: notif-shrink ' + dur + 'ms linear forwards;"></div>';
+        notificationsEl.appendChild(el);
+        playNotificationSound();
+        requestAnimationFrame(function() { el.classList.add('show'); });
+        setTimeout(function() {
+          el.classList.remove('show');
+          el.classList.add('exit');
+          setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 320);
+        }, dur);
+      }
+
+      window.addEventListener('message', function(e) {
+        var d = e.data;
+        if (typeof d === 'string') try { d = JSON.parse(d); } catch (err) { return; }
+        if (!d || !d.action) return;
+
+        document.body.classList.add('in-game');
+
+        /* First message: show keybind only if not showing choice (choice is shown on injection) */
+        if (!keybindPromptShown && d.action !== 'showChoice') {
+          showKeybindPrompt();
+          document.addEventListener('keydown', onKeybindKeyDown);
+        }
+
+        if (d.action === 'setResolution') return;
+        /* Choice overlay: two buttons Macho / Motion DUI */
+        if (d.action === 'showChoice') {
+          document.getElementById('choice-overlay').classList.add('show');
+          return;
+        }
+        if (d.action === 'showScrollMenu') {
+          document.getElementById('choice-overlay').classList.remove('show');
+          if (d.banner && bannerImg) { bannerImg.src = d.banner; bannerImg.style.display = ''; document.getElementById('banner-text').style.display = 'none'; }
+          elements = (d.elements && Array.isArray(d.elements)) ? d.elements : [];
+          categories = d.categories || null;
+          categoryIndex = d.categoryIndex || 0;
+          history = [];
+          selectedIndex = 0;
+          panel.classList.add('visible');
+          updateMenu();
+          tabsEl.focus();
+          /* Motion logo bottom-left when using Motion DUI */
+          var logoWrap = document.getElementById('motion-logo');
+          var logoImg = document.getElementById('motion-logo-img');
+          if (d.motionLogo && logoWrap && logoImg) {
+            logoWrap.classList.add('show');
+            if (d.logoUrl) logoImg.src = d.logoUrl;
+            logoImg.style.display = logoImg.src ? '' : 'none';
+          }
+        }
+        if (d.action === 'hideScrollMenu') panel.classList.remove('visible');
+        if (d.action === 'updateElements' && d.elements && Array.isArray(d.elements)) {
+          elements = d.elements;
+          if (d.index != null) selectedIndex = Math.max(0, Math.min(d.index, elements.length - 1));
+          updateMenu();
+        }
+        /* Notifications: Lua sends action "showNotification" with title, desc, duration */
+        if (d.action === 'showNotification') {
+          showNotification(d.title || 'Notification', d.desc || d.message || '', d.duration || 4000);
+        }
+        /* Keybind prompt: Lua can request to show again with showKeybindPrompt */
+        if (d.action === 'showKeybindPrompt') {
+          showKeybindPrompt();
+          document.removeEventListener('keydown', onKeybindKeyDown);
+          document.addEventListener('keydown', onKeybindKeyDown);
+        }
+        /* Text input: Lua sends showTextInput with title, placeholder, maxLength, callback */
+        if (d.action === 'showTextInput') {
+          showTextInputModal(d.title || 'Enter value', d.placeholder || '', d.maxLength || 0, d.callback || '');
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
